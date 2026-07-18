@@ -143,7 +143,21 @@ class RingParallelAttention:
                 joint_strategy=joint_strategy,
             )
 
-        from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
+        from vllm_omni.diffusion.attention.backends.ring_flash_attn import (
+            ring_flash_attn_func,
+            ring_flash_attn_func_opt,
+        )
+
+        # Optimized ring path (packed-KV comm + fused Triton merge + workspace).
+        # Default ON: set VLLM_OMNI_RING_FLASH_OPT=0 to fall back to the baseline
+        # (byte-for-byte the original implementation) for A/B comparison.
+        import os
+
+        ring_fn = (
+            ring_flash_attn_func
+            if os.environ.get("VLLM_OMNI_RING_FLASH_OPT", "1") == "0"
+            else ring_flash_attn_func_opt
+        )
 
         # Prefer FA3 over FA2 for better performance (FA3 supports Ampere/Ada/Hopper)
         # On ROCm, use AITER
@@ -154,7 +168,7 @@ class RingParallelAttention:
         else:
             attn_type = AttnType.FA
 
-        return ring_flash_attn_func(
+        return ring_fn(
             query,
             key,
             value,
