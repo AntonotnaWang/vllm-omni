@@ -3,8 +3,8 @@
 
 Compares, on the *same* sharded inputs, three implementations:
 
-  * baseline : ``ring_flash_attn_func``          (original ring path)
-  * optimized: ``ring_flash_attn_func_opt``      (packed-KV double-buffered comm
+  * baseline : ``ring_flash_attn_func_org``  (original ring path, test-only)
+  * optimized: ``ring_flash_attn_func``      (packed-KV double-buffered comm
                + fused Triton online-softmax merge + persistent fp32 workspace)
   * reference: full (non-ring) attention in fp32 (torch SDPA or a manual kernel)
 
@@ -38,6 +38,9 @@ exercises the packed-KV double-buffered ring comm. Exit code is non-zero if any
 correctness check FAILs, so this doubles as a regression test.
 """
 
+# torch and vllm_omni imports are intentionally below `_preload_cuda13_runtime()`
+# (the re-exec must set LD_LIBRARY_PATH before torch is imported).
+# ruff: noqa: E402
 import argparse
 import glob
 import os
@@ -93,24 +96,24 @@ from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.backends.ring.ring_triton import HAS_TRITON_MERGE
 from vllm_omni.diffusion.attention.backends.ring_flash_attn import (
     ring_flash_attn_func,
-    ring_flash_attn_func_opt,
+    ring_flash_attn_func_org,
 )
 
 # Which optional features each block-attention backend actually honors. A case
 # whose required feature is not in this set is SKIPPED (running it would compare
 # against a reference the kernel silently ignores, i.e. a false failure).
 BACKEND_CAPS = {
-    "torch": {"scale", "causal"},                                       # SDPA (efficient) - no GQA/window/softcap/alibi
+    "torch": {"scale", "causal"},  # SDPA (efficient) - no GQA/window/softcap/alibi
     "fa": {"scale", "causal", "gqa", "window", "softcap", "alibi", "dropout"},
-    "fa3": {"scale", "causal", "gqa", "window", "softcap"},             # dropout ignored, alibi not forwarded
+    "fa3": {"scale", "causal", "gqa", "window", "softcap"},  # dropout ignored, alibi not forwarded
     "aiter": {"scale", "causal", "gqa", "window", "alibi", "dropout"},
 }
 # Backends where dropout_p>0 is stochastic (so opt!=baseline run-to-run and can
 # only be finiteness-checked). fa3 ignores dropout entirely -> deterministic.
 DROPOUT_RANDOM = {"torch", "fa", "aiter"}
 
-TOL_OPT_VS_BASE = 2e-2   # bf16 reduction-order noise between opt and baseline
-TOL_VS_REF = 5e-2        # bf16 ring output vs fp32 full-attention reference
+TOL_OPT_VS_BASE = 2e-2  # bf16 reduction-order noise between opt and baseline
+TOL_VS_REF = 5e-2  # bf16 ring output vs fp32 full-attention reference
 
 
 def _setup():
@@ -147,20 +150,27 @@ def _ref_sdpa(q, k, v, world_size, rank, *, scale, causal):
     if causal:
         q_full = _all_gather_seq(qf, world_size)
         out = F.scaled_dot_product_attention(
-            q_full.transpose(1, 2), k_full.transpose(1, 2), v_full.transpose(1, 2),
-            is_causal=True, scale=scale, enable_gqa=gqa,
+            q_full.transpose(1, 2),
+            k_full.transpose(1, 2),
+            v_full.transpose(1, 2),
+            is_causal=True,
+            scale=scale,
+            enable_gqa=gqa,
         ).transpose(1, 2)
         s_local = q.shape[1]
-        return out[:, rank * s_local:(rank + 1) * s_local]
+        return out[:, rank * s_local : (rank + 1) * s_local]
     out = F.scaled_dot_product_attention(
-        qf.transpose(1, 2), k_full.transpose(1, 2), v_full.transpose(1, 2),
-        is_causal=False, scale=scale, enable_gqa=gqa,
+        qf.transpose(1, 2),
+        k_full.transpose(1, 2),
+        v_full.transpose(1, 2),
+        is_causal=False,
+        scale=scale,
+        enable_gqa=gqa,
     ).transpose(1, 2)
     return out
 
 
-def _ref_manual(q, k, v, world_size, rank, *, scale, causal, window, softcap,
-                joint_k=None, joint_v=None):
+def _ref_manual(q, k, v, world_size, rank, *, scale, causal, window, softcap, joint_k=None, joint_v=None):
     """Explicit fp32 full-attention reference supporting scale, causal, sliding
     window, softcap and joint (front) tokens. Materializes the score matrix, so
     only used at moderate seq lengths in the param sweep."""
@@ -175,7 +185,7 @@ def _ref_manual(q, k, v, world_size, rank, *, scale, causal, window, softcap,
     else:
         k_all, v_all, n_joint = k_full, v_full, 0
 
-    qh = q.float().transpose(1, 2)                 # (B, Hq, Sq, D)
+    qh = q.float().transpose(1, 2)  # (B, Hq, Sq, D)
     kh = _repeat_kv(k_all.transpose(1, 2), qh.shape[1])
     vh = _repeat_kv(v_all.transpose(1, 2), qh.shape[1])
 
@@ -209,7 +219,7 @@ def _max_abs_diff(a, b):
 
 
 def _bench(fn, iters):
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -217,13 +227,12 @@ def _bench(fn, iters):
     for _ in range(iters):
         fn()
     end.record()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return start.elapsed_time(end) / iters  # ms/iter
 
 
 def _alibi_slopes(hq, device):
-    return torch.tensor([2.0 ** (-8.0 * (i + 1) / hq) for i in range(hq)],
-                        device=device, dtype=torch.float32)
+    return torch.tensor([2.0 ** (-8.0 * (i + 1) / hq) for i in range(hq)], device=device, dtype=torch.float32)
 
 
 def run_case(case, rank, world_size, local_rank, attn_type, backend, iters):
@@ -239,7 +248,7 @@ def run_case(case, rank, world_size, local_rank, attn_type, backend, iters):
     b, s = case["batch"], case["seqlen"]
     hq, hkv, d = case["hq"], case["hkv"], case["d"]
     causal = case.get("causal", False)
-    scale = case.get("scale") or d ** -0.5
+    scale = case.get("scale") or d**-0.5
     window = case.get("window", (-1, -1))
     softcap = case.get("softcap", 0.0)
     dropout = case.get("dropout", 0.0)
@@ -258,18 +267,23 @@ def run_case(case, rank, world_size, local_rank, attn_type, backend, iters):
         joint_k = torch.randn(b, js, hkv, d, device=device, dtype=dtype, generator=g)
         joint_v = torch.randn(b, js, hkv, d, device=device, dtype=dtype, generator=g)
 
-    common = dict(dropout_p=dropout, softmax_scale=scale, causal=causal,
-                  window_size=tuple(window), softcap=softcap, group=None,
-                  attn_type=attn_type)
+    common = dict(
+        dropout_p=dropout,
+        softmax_scale=scale,
+        causal=causal,
+        window_size=tuple(window),
+        softcap=softcap,
+        group=None,
+        attn_type=attn_type,
+    )
     if use_alibi:
         common["alibi_slopes"] = _alibi_slopes(hq, device)
     if joint:
-        common.update(joint_tensor_key=joint_k, joint_tensor_value=joint_v,
-                      joint_strategy="front")
+        common.update(joint_tensor_key=joint_k, joint_tensor_value=joint_v, joint_strategy="front")
 
     try:
-        out_base = ring_flash_attn_func(q, k, v, **common)
-        out_opt = ring_flash_attn_func_opt(q, k, v, **common)
+        out_base = ring_flash_attn_func_org(q, k, v, **common)
+        out_opt = ring_flash_attn_func(q, k, v, **common)
     except Exception as e:  # unsupported kernel combo (e.g. FA3 built with DISABLE_LOCAL)
         return "SKIP", f"SKIP {label:34s} | backend raised: {type(e).__name__}: {str(e)[:60]}"
 
@@ -299,27 +313,41 @@ def run_case(case, rank, world_size, local_rank, attn_type, backend, iters):
             if ref_mode == "sdpa":
                 ref = _ref_sdpa(q, k, v, world_size, rank, scale=scale, causal=causal)
             else:
-                ref = _ref_manual(q, k, v, world_size, rank, scale=scale, causal=causal,
-                                  window=window, softcap=softcap, joint_k=joint_k, joint_v=joint_v)
+                ref = _ref_manual(
+                    q,
+                    k,
+                    v,
+                    world_size,
+                    rank,
+                    scale=scale,
+                    causal=causal,
+                    window=window,
+                    softcap=softcap,
+                    joint_k=joint_k,
+                    joint_v=joint_v,
+                )
             d_or = _max_abs_diff(out_opt, ref)
             d_br = _max_abs_diff(out_base, ref)
             del ref
         except torch.cuda.OutOfMemoryError:
             d_or = d_br = -1.0
             ref_oom = True
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
     # warmup + timing
     for _ in range(5):
+        ring_flash_attn_func_org(q, k, v, **common)
         ring_flash_attn_func(q, k, v, **common)
-        ring_flash_attn_func_opt(q, k, v, **common)
-    t_base = _bench(lambda: ring_flash_attn_func(q, k, v, **common), iters)
-    t_opt = _bench(lambda: ring_flash_attn_func_opt(q, k, v, **common), iters)
+    t_base = _bench(lambda: ring_flash_attn_func_org(q, k, v, **common), iters)
+    t_opt = _bench(lambda: ring_flash_attn_func(q, k, v, **common), iters)
 
     # reduce across ranks: worst diff, mean time
     stats = torch.tensor([d_ob, d_or, d_br, t_base, t_opt], device=device)
-    mx = stats.clone(); dist.all_reduce(mx, op=dist.ReduceOp.MAX)
-    mean = stats.clone(); dist.all_reduce(mean, op=dist.ReduceOp.SUM); mean /= world_size
+    mx = stats.clone()
+    dist.all_reduce(mx, op=dist.ReduceOp.MAX)
+    mean = stats.clone()
+    dist.all_reduce(mean, op=dist.ReduceOp.SUM)
+    mean /= world_size
     d_ob, d_or, d_br = mx[0].item(), mx[1].item(), mx[2].item()
     t_base, t_opt = mean[3].item(), mean[4].item()
 
@@ -329,8 +357,10 @@ def run_case(case, rank, world_size, local_rank, attn_type, backend, iters):
 
     ob_s = "rand-finite" if dropout_random else f"{d_ob:.2e}"
     ref_s = ("  oom  " if ref_oom else "  -  ") if d_or < 0 else f"{d_or:.2e}"
-    row = (f"{verdict} {label:34s} | opt-vs-base {ob_s:>11s}  opt-vs-ref {ref_s:>9s} | "
-           f"base {t_base:7.3f}ms  opt {t_opt:7.3f}ms  speedup {t_base / t_opt:4.2f}x")
+    row = (
+        f"{verdict} {label:34s} | opt-vs-base {ob_s:>11s}  opt-vs-ref {ref_s:>9s} | "
+        f"base {t_base:7.3f}ms  opt {t_opt:7.3f}ms  speedup {t_base / t_opt:4.2f}x"
+    )
     return verdict, row
 
 
@@ -353,9 +383,8 @@ def _select_backend(requested, local_rank):
         at = AttnType.from_string(name)
         try:
             q = torch.randn(1, 16, 4, 64, device=device, dtype=torch.bfloat16)
-            ring_flash_attn_func(q, q, q, softmax_scale=64 ** -0.5, causal=False,
-                                 group=None, attn_type=at)
-            torch.cuda.synchronize()
+            ring_flash_attn_func_org(q, q, q, softmax_scale=64**-0.5, causal=False, group=None, attn_type=at)
+            torch.accelerator.synchronize()
             return name, at
         except Exception:
             continue
@@ -369,16 +398,24 @@ def _build_cases(quick):
     head_dims = [64, 128] if quick else [64, 128, 256]
     head_cfgs = [(16, 16), (16, 4)]  # MHA, GQA
     for causal in (False, True):
-        for (hq, hkv) in head_cfgs:
+        for hq, hkv in head_cfgs:
             for d in head_dims:
                 for s in seqlens:
                     tag = "MHA" if hq == hkv else f"GQA{hq}/{hkv}"
                     needs = {"gqa"} if hq != hkv else set()
-                    cases.append(dict(
-                        label=f"shape s={s} d={d} {tag} causal={int(causal)}",
-                        batch=1, seqlen=s, hq=hq, hkv=hkv, d=d, causal=causal,
-                        ref="sdpa", needs=needs,
-                    ))
+                    cases.append(
+                        dict(
+                            label=f"shape s={s} d={d} {tag} causal={int(causal)}",
+                            batch=1,
+                            seqlen=s,
+                            hq=hq,
+                            hkv=hkv,
+                            d=d,
+                            causal=causal,
+                            ref="sdpa",
+                            needs=needs,
+                        )
+                    )
     # ---- PARAM SWEEP: one non-default parameter at a time (moderate shape) ----
     P = dict(batch=1, seqlen=1024, hq=16, hkv=16, d=128)
     cases += [
@@ -403,8 +440,10 @@ def main():
     backend, attn_type = _select_backend(args.attn_type, local_rank)
 
     if rank == 0:
-        print(f"backend={backend}  attn_type={attn_type.value}  world_size={world_size} (ring degree)  "
-              f"HAS_TRITON_MERGE={HAS_TRITON_MERGE}")
+        print(
+            f"backend={backend}  attn_type={attn_type.value}  world_size={world_size} (ring degree)  "
+            f"HAS_TRITON_MERGE={HAS_TRITON_MERGE}"
+        )
         print(f"capabilities honored: {sorted(BACKEND_CAPS[backend])}")
         print(f"tolerances: opt-vs-base <= {TOL_OPT_VS_BASE:.0e}, vs-ref <= {TOL_VS_REF:.0e}")
         print("=" * 120)
@@ -424,8 +463,7 @@ def main():
 
     if rank == 0:
         print("=" * 120)
-        print(f"SUMMARY: {n_pass} PASS, {n_fail} FAIL, {n_skip} SKIP  "
-              f"(backend={backend}, world_size={world_size})")
+        print(f"SUMMARY: {n_pass} PASS, {n_fail} FAIL, {n_skip} SKIP  (backend={backend}, world_size={world_size})")
 
     dist.barrier()
     dist.destroy_process_group()

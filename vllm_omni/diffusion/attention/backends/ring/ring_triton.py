@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
+# Triton kernel constexpr params use uppercase (BLOCK_M, BLOCK_D, D) by convention.
+# ruff: noqa: N803
+#
 # Fused online-softmax merge for Ring Attention (inference / forward only).
 #
 # This is *new* optimization code — it does NOT replace ``ring_utils.py``.
 # ``ring_utils.update_out_and_lse`` (the original, defensive torch path) is
-# still used by the baseline ``ring_flash_attn_forward``.  This module provides
+# still used by the baseline ``ring_flash_attn_forward_org``.  This module provides
 # a single fused Triton kernel that collapses the per-step online-softmax merge
 # (baseline: several elementwise kernels for sigmoid/logsigmoid/sub/mul + a
 # bf16<->fp32 round-trip) into one launch that writes in place on fp32
@@ -39,17 +42,17 @@ if HAS_TRITON_MERGE:
 
     @triton.jit
     def _ring_merge_kernel(
-        block_out_ptr,   # (B, S, H, D)   compute dtype, contiguous
-        block_lse_ptr,   # (B*S*H,)       fp32, row-aligned to out (see wrapper)
-        out_acc_ptr,     # (B, S, H, D)   fp32 accumulator, contiguous
-        lse_acc_ptr,     # (B, S, H, 1)   fp32 accumulator, contiguous
-        out_ptr,         # (B, S, H, D)   output dtype (e.g. bf16), contiguous
-        n_rows,          # B * S * H
-        is_first: tl.constexpr,   # first valid step: nothing to merge with
-        is_final: tl.constexpr,   # last valid step: write result to out_ptr (bf16)
-        D: tl.constexpr,          # head_dim
-        BLOCK_M: tl.constexpr,    # rows per program
-        BLOCK_D: tl.constexpr,    # next_pow2(head_dim)
+        block_out_ptr,  # (B, S, H, D)   compute dtype, contiguous
+        block_lse_ptr,  # (B*S*H,)       fp32, row-aligned to out (see wrapper)
+        out_acc_ptr,  # (B, S, H, D)   fp32 accumulator, contiguous
+        lse_acc_ptr,  # (B, S, H, 1)   fp32 accumulator, contiguous
+        out_ptr,  # (B, S, H, D)   output dtype (e.g. bf16), contiguous
+        n_rows,  # B * S * H
+        is_first: tl.constexpr,  # first valid step: nothing to merge with
+        is_final: tl.constexpr,  # last valid step: write result to out_ptr (bf16)
+        D: tl.constexpr,  # head_dim
+        BLOCK_M: tl.constexpr,  # rows per program
+        BLOCK_D: tl.constexpr,  # next_pow2(head_dim)
     ):
         pid = tl.program_id(axis=0)
         rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -57,18 +60,14 @@ if HAS_TRITON_MERGE:
         rmask = rows < n_rows
         mask = rmask[:, None] & (cols[None, :] < D)
 
-        bo = tl.load(
-            block_out_ptr + rows[:, None] * D + cols[None, :], mask=mask, other=0.0
-        ).to(tl.float32)
+        bo = tl.load(block_out_ptr + rows[:, None] * D + cols[None, :], mask=mask, other=0.0).to(tl.float32)
         blse = tl.load(block_lse_ptr + rows, mask=rmask, other=0.0)
 
         if is_first:
             merged_out = bo
             merged_lse = blse
         else:
-            old_out = tl.load(
-                out_acc_ptr + rows[:, None] * D + cols[None, :], mask=mask, other=0.0
-            )
+            old_out = tl.load(out_acc_ptr + rows[:, None] * D + cols[None, :], mask=mask, other=0.0)
             old_lse = tl.load(lse_acc_ptr + rows, mask=rmask, other=0.0)
             s = blse - old_lse
             sig = tl.sigmoid(s)
@@ -86,16 +85,14 @@ if HAS_TRITON_MERGE:
                 mask=mask,
             )
         else:
-            tl.store(
-                out_acc_ptr + rows[:, None] * D + cols[None, :], merged_out, mask=mask
-            )
+            tl.store(out_acc_ptr + rows[:, None] * D + cols[None, :], merged_out, mask=mask)
 
     def fused_merge(
-        out_acc: torch.Tensor,   # (B, S, H, D) fp32, in/out accumulator
-        lse_acc: torch.Tensor,   # (B, S, H, 1) fp32, in/out accumulator
-        out: torch.Tensor,       # (B, S, H, D) output dtype, written on final step
-        block_out: torch.Tensor, # (B, S, H, D) compute dtype
-        block_lse: torch.Tensor, # (B, H, S) fp32
+        out_acc: torch.Tensor,  # (B, S, H, D) fp32, in/out accumulator
+        lse_acc: torch.Tensor,  # (B, S, H, 1) fp32, in/out accumulator
+        out: torch.Tensor,  # (B, S, H, D) output dtype, written on final step
+        block_out: torch.Tensor,  # (B, S, H, D) compute dtype
+        block_lse: torch.Tensor,  # (B, H, S) fp32
         is_first: bool,
         is_final: bool,
     ) -> None:

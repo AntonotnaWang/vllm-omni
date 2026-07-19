@@ -29,20 +29,19 @@ def _baseline_merge(block_out, block_lse, steps):
 
 def _fused_merge(out_acc, lse_acc, out, block_out, block_lse, steps):
     for step in range(steps):
-        fused_merge(out_acc, lse_acc, out, block_out, block_lse,
-                    is_first=(step == 0), is_final=(step == steps - 1))
+        fused_merge(out_acc, lse_acc, out, block_out, block_lse, is_first=(step == 0), is_final=(step == steps - 1))
     return out
 
 
 def _time(fn, iters):
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
         fn()
     end.record()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return start.elapsed_time(end) / iters  # ms/iter
 
 
@@ -68,8 +67,11 @@ def main():
     lse_acc = torch.empty(b, s, h, 1, device=dev, dtype=torch.float32)
     out = torch.empty_like(block_out)
 
-    base_fn = lambda: _baseline_merge(block_out, block_lse, args.steps)
-    fuse_fn = lambda: _fused_merge(out_acc, lse_acc, out, block_out, block_lse, args.steps)
+    def base_fn():
+        return _baseline_merge(block_out, block_lse, args.steps)
+
+    def fuse_fn():
+        return _fused_merge(out_acc, lse_acc, out, block_out, block_lse, args.steps)
 
     # correctness: same inputs -> same accumulated result
     ref = base_fn()
@@ -77,7 +79,8 @@ def main():
     max_diff = (ref.float() - got.float()).abs().max().item()
 
     for _ in range(20):  # warmup
-        base_fn(); fuse_fn()
+        base_fn()
+        fuse_fn()
     t_base = _time(base_fn, args.iters)
     t_fuse = _time(fuse_fn, args.iters)
 

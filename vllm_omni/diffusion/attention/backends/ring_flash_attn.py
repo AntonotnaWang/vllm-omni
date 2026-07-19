@@ -12,7 +12,17 @@ from vllm_omni.diffusion.attention.backends.ring.ring_utils import update_out_an
 from vllm_omni.diffusion.distributed.comm import RingComm
 
 
-def ring_flash_attn_forward(
+# ===========================================================================
+# Original (baseline) Ring Flash Attention — the ``*_org`` family below.
+# ---------------------------------------------------------------------------
+# NOT USED IN PRODUCTION. Core (``parallel/ring.py``) always calls the canonical
+# ``ring_flash_attn_func`` (the optimized implementation further down). These
+# ``*_org`` functions are the pre-optimization reference, kept ONLY so the
+# benchmarks/tests can A/B the two paths (see
+# ``tests/diffusion/attention/bench_ring_flash_attn_opt.py``). Do not wire them
+# into any runtime path.
+# ===========================================================================
+def ring_flash_attn_forward_org(
     process_group,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -110,7 +120,7 @@ def ring_flash_attn_forward(
     return out, lse
 
 
-class RingFlashAttnFunc(torch.autograd.Function):
+class RingFlashAttnFuncOrg(torch.autograd.Function):
     """Ring Flash Attention autograd function (inference only, no backward)."""
 
     @staticmethod
@@ -142,7 +152,7 @@ class RingFlashAttnFunc(torch.autograd.Function):
         k = k.contiguous()
         v = v.contiguous()
 
-        out, softmax_lse = ring_flash_attn_forward(
+        out, softmax_lse = ring_flash_attn_forward_org(
             group,
             q,
             k,
@@ -163,7 +173,7 @@ class RingFlashAttnFunc(torch.autograd.Function):
         return out if not return_softmax else (out, softmax_lse, None)
 
 
-def ring_flash_attn_qkvpacked_func(
+def ring_flash_attn_qkvpacked_func_org(
     qkv,
     dropout_p=0.0,
     softmax_scale=None,
@@ -176,7 +186,7 @@ def ring_flash_attn_qkvpacked_func(
     group=None,
     attn_type: AttnType = AttnType.FA,
 ):
-    return RingFlashAttnFunc.apply(
+    return RingFlashAttnFuncOrg.apply(
         qkv[:, :, 0],
         qkv[:, :, 1],
         qkv[:, :, 2],
@@ -197,7 +207,7 @@ def ring_flash_attn_qkvpacked_func(
     )
 
 
-def ring_flash_attn_kvpacked_func(
+def ring_flash_attn_kvpacked_func_org(
     q,
     kv,
     dropout_p=0.0,
@@ -211,7 +221,7 @@ def ring_flash_attn_kvpacked_func(
     group=None,
     attn_type: AttnType = AttnType.FA,
 ):
-    return RingFlashAttnFunc.apply(
+    return RingFlashAttnFuncOrg.apply(
         q,
         kv[:, :, 0],
         kv[:, :, 1],
@@ -232,7 +242,7 @@ def ring_flash_attn_kvpacked_func(
     )
 
 
-def ring_flash_attn_func(
+def ring_flash_attn_func_org(
     q,
     k,
     v,
@@ -297,7 +307,7 @@ def ring_flash_attn_func(
             - If return_attn_probs is False: Output tensor (batch, seq_len, num_heads, head_dim).
             - If return_attn_probs is True: A tuple (out, softmax_lse, None).
     """
-    return RingFlashAttnFunc.apply(
+    return RingFlashAttnFuncOrg.apply(
         q,
         k,
         v,
@@ -319,20 +329,20 @@ def ring_flash_attn_func(
 
 
 # ===========================================================================
-# Optimized Ring Flash Attention (forward / inference only)
+# Canonical Ring Flash Attention (forward / inference only) — the DEFAULT path.
 # ---------------------------------------------------------------------------
-# The code below is ADDED alongside the baseline above (nothing removed) so the
-# two can be benchmarked head-to-head. It layers three optimizations on top of
-# the baseline path:
+# This is the implementation core (``parallel/ring.py``) actually calls via
+# ``ring_flash_attn_func``. It layers three optimizations over the ``*_org``
+# baseline above:
 #   1. Packed-KV, double-buffered ring comm  -> 2 P2P ops per hop (was 4) and
 #      zero per-hop allocation.
 #   2. Fused Triton online-softmax merge     -> one kernel per step instead of
 #      several elementwise kernels + bf16<->fp32 round trip.
 #   3. Persistent fp32 workspace + direct bf16 write on the final step.
 # Semantics (joint front/rear, causal step-0, SPARSE_SAGE bypass, GQA, return
-# contract) are identical to the baseline; when Triton is unavailable or the
-# backend has no mergeable LSE (SPARSE_SAGE) it transparently delegates to the
-# baseline ``ring_flash_attn_forward``.
+# contract) are identical to the ``*_org`` baseline; when Triton is unavailable
+# or the backend has no mergeable LSE (SPARSE_SAGE) it transparently delegates
+# to ``ring_flash_attn_forward_org``.
 # ===========================================================================
 class DoubleBufRingComm:
     """Double-buffered ring P2P that ships K and V packed into one tensor.
@@ -381,9 +391,16 @@ class _ForwardWorkspace:
     """
 
     __slots__ = (
-        "kv_bufs", "k_bufs", "v_bufs", "kv_send",
-        "out_acc", "lse_acc",
-        "q_shape", "kv_shape", "dtype", "device",
+        "kv_bufs",
+        "k_bufs",
+        "v_bufs",
+        "kv_send",
+        "out_acc",
+        "lse_acc",
+        "q_shape",
+        "kv_shape",
+        "dtype",
+        "device",
     )
 
     def __init__(self, q: torch.Tensor, k: torch.Tensor):
@@ -420,7 +437,7 @@ def _get_fwd_ws(q: torch.Tensor, k: torch.Tensor) -> _ForwardWorkspace:
     return _FWD_WS
 
 
-def ring_flash_attn_forward_opt(
+def ring_flash_attn_forward(
     process_group,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -440,7 +457,7 @@ def ring_flash_attn_forward_opt(
 ):
     """Optimized forward: packed-KV ring comm + fused Triton merge + workspace.
 
-    Drop-in for :func:`ring_flash_attn_forward` with identical outputs. Falls
+    Drop-in for :func:`ring_flash_attn_forward_org` with identical outputs. Falls
     back to the baseline when Triton is unavailable or the backend produces no
     mergeable LSE (``SPARSE_SAGE``).
     """
@@ -456,7 +473,7 @@ def ring_flash_attn_forward_opt(
 
     # Delegate to the baseline when the fast path does not apply.
     if not HAS_TRITON_MERGE or attn_type == AttnType.SPARSE_SAGE:
-        return ring_flash_attn_forward(
+        return ring_flash_attn_forward_org(
             process_group,
             q,
             k,
@@ -570,11 +587,11 @@ def ring_flash_attn_forward_opt(
     return out, lse
 
 
-class RingFlashAttnFuncOpt(torch.autograd.Function):
+class RingFlashAttnFunc(torch.autograd.Function):
     """Optimized Ring Flash Attention (inference only, no backward).
 
-    Same signature/semantics as :class:`RingFlashAttnFunc`, backed by
-    :func:`ring_flash_attn_forward_opt`.
+    Same signature/semantics as :class:`RingFlashAttnFuncOrg`, backed by
+    :func:`ring_flash_attn_forward`.
     """
 
     @staticmethod
@@ -606,7 +623,7 @@ class RingFlashAttnFuncOpt(torch.autograd.Function):
         k = k.contiguous()
         v = v.contiguous()
 
-        out, softmax_lse = ring_flash_attn_forward_opt(
+        out, softmax_lse = ring_flash_attn_forward(
             group,
             q,
             k,
@@ -632,7 +649,7 @@ class RingFlashAttnFuncOpt(torch.autograd.Function):
         return out, lse_ret, None
 
 
-def ring_flash_attn_qkvpacked_func_opt(
+def ring_flash_attn_qkvpacked_func(
     qkv,
     dropout_p=0.0,
     softmax_scale=None,
@@ -645,7 +662,7 @@ def ring_flash_attn_qkvpacked_func_opt(
     group=None,
     attn_type: AttnType = AttnType.FA,
 ):
-    return RingFlashAttnFuncOpt.apply(
+    return RingFlashAttnFunc.apply(
         qkv[:, :, 0],
         qkv[:, :, 1],
         qkv[:, :, 2],
@@ -666,7 +683,7 @@ def ring_flash_attn_qkvpacked_func_opt(
     )
 
 
-def ring_flash_attn_kvpacked_func_opt(
+def ring_flash_attn_kvpacked_func(
     q,
     kv,
     dropout_p=0.0,
@@ -680,7 +697,7 @@ def ring_flash_attn_kvpacked_func_opt(
     group=None,
     attn_type: AttnType = AttnType.FA,
 ):
-    return RingFlashAttnFuncOpt.apply(
+    return RingFlashAttnFunc.apply(
         q,
         kv[:, :, 0],
         kv[:, :, 1],
@@ -701,7 +718,7 @@ def ring_flash_attn_kvpacked_func_opt(
     )
 
 
-def ring_flash_attn_func_opt(
+def ring_flash_attn_func(
     q,
     k,
     v,
@@ -720,14 +737,14 @@ def ring_flash_attn_func_opt(
     joint_tensor_value=None,
     joint_strategy="front",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, None]:
-    """Optimized drop-in for :func:`ring_flash_attn_func`.
+    """Optimized drop-in for :func:`ring_flash_attn_func_org`.
 
     Identical arguments and return contract; uses packed-KV double-buffered ring
     comm + a fused Triton online-softmax merge + a persistent fp32 workspace.
     Transparently falls back to the baseline for ``SPARSE_SAGE`` or when Triton
     is unavailable.
     """
-    return RingFlashAttnFuncOpt.apply(
+    return RingFlashAttnFunc.apply(
         q,
         k,
         v,

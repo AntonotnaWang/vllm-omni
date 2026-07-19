@@ -9,6 +9,7 @@ the 25 denoising steps, NOT a correctness bug. This probe settles it: load ONE e
 frame diff. If two identical runs already diverge by a comparable amount, the A/B diff
 is inherent engine nondeterminism, not the optimization.
 """
+
 import argparse
 import glob
 import os
@@ -21,7 +22,7 @@ def _ensure_cu13():
     compat = os.path.join(sys.prefix, "cuda13-compat")
     if glob.glob(os.path.join(compat, "libcuda.so*")):
         dirs.append(compat)
-    for base in (site.getsitepackages() if hasattr(site, "getsitepackages") else []):
+    for base in site.getsitepackages() if hasattr(site, "getsitepackages") else []:
         d = os.path.join(base, "nvidia", "cu13", "lib")
         if glob.glob(os.path.join(d, "libcudart.so.13")):
             dirs.append(d)
@@ -38,8 +39,11 @@ def _ensure_cu13():
 def main():
     _ensure_cu13()
     p = argparse.ArgumentParser()
-    p.add_argument("--model", required=True,
-                   help="Path or HF id of the Wan2.2 T2V checkpoint (e.g. Wan-AI/Wan2.2-T2V-A14B-Diffusers).")
+    p.add_argument(
+        "--model",
+        required=True,
+        help="Path or HF id of the Wan2.2 T2V checkpoint (e.g. Wan-AI/Wan2.2-T2V-A14B-Diffusers).",
+    )
     p.add_argument("--opt", type=int, default=0)
     p.add_argument("--ring-degree", type=int, default=4)
     p.add_argument("--steps", type=int, default=25)
@@ -49,22 +53,33 @@ def main():
     p.add_argument("--seed", type=int, default=142)
     args = p.parse_args()
 
-    os.environ["VLLM_OMNI_RING_FLASH_OPT"] = str(args.opt)
-
     import numpy as np
     import torch
 
-    # reuse the frame extractor from the bench
+    # reuse helpers from the bench
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from bench_wan_t2v_ring_opt import _frames_to_numpy
+    from bench_wan_t2v_ring_opt import _frames_to_numpy, _install_baseline_ring_injection
 
-    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    # Core always uses the optimized ``ring_flash_attn_func``; for the opt=0
+    # control, force the original ``ring_flash_attn_func_org`` by injecting a
+    # sitecustomize that the engine's spawned workers inherit (before Omni build).
+    if args.opt == 0:
+        _install_baseline_ring_injection()
+
     from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+    # Pass the flat diffusion-parallel fields + an explicit ``devices`` list (not a
+    # pre-built parallel_config object): Wan2.2 resolves through the pipeline
+    # registry, which drops a passed parallel_config and defaults to a single GPU.
+    # use_hsdp shards the A14B weights so they fit across the ring group; it does
+    # not affect run-to-run determinism (identical in both generations).
     omni = Omni(
         model=args.model,
-        parallel_config=DiffusionParallelConfig(ring_degree=args.ring_degree, ulysses_degree=1, use_hsdp=False),
+        ring_degree=args.ring_degree,
+        ulysses_degree=1,
+        use_hsdp=True,
+        devices=",".join(str(i) for i in range(args.ring_degree)),
         enforce_eager=True,
         vae_use_tiling=True,
         init_timeout=3600,
@@ -74,9 +89,14 @@ def main():
 
     def gen():
         sp = OmniDiffusionSamplingParams(
-            height=args.height, width=args.width, num_frames=args.num_frames,
-            seed=args.seed, generator=torch.Generator(device="cuda").manual_seed(args.seed),
-            num_inference_steps=args.steps, guidance_scale=4.0, guidance_scale_2=3.0,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            seed=args.seed,
+            generator=torch.Generator(device="cuda").manual_seed(args.seed),
+            num_inference_steps=args.steps,
+            guidance_scale=4.0,
+            guidance_scale_2=3.0,
             num_outputs_per_prompt=1,
         )
         return _frames_to_numpy(omni.generate(prompt, sp))
@@ -84,8 +104,8 @@ def main():
     a = gen().astype(np.float64)
     b = gen().astype(np.float64)
     diff = np.abs(a - b)
-    mse = (diff ** 2).mean()
-    psnr = float("inf") if mse == 0 else 10 * np.log10(255.0 ** 2 / mse)
+    mse = (diff**2).mean()
+    psnr = float("inf") if mse == 0 else 10 * np.log10(255.0**2 / mse)
     print(f"\n##### DETERMINISM CONTROL (opt={args.opt}, same seed twice) #####")
     print(f"  shape           : {tuple(int(x) for x in a.shape)}")
     print(f"  max pixel diff  : {diff.max():.0f} / 255")

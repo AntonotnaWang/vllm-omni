@@ -276,3 +276,16 @@ tests/.ci_generated/
 
 # Local Lance precision-matching dump scripts (not part of the repo)
 lance_compare/
+
+# Ring-attention benchmark artifacts (tests/diffusion/attention/bench_wan_t2v_*)
+# Default --workdir is a system temp dir; these catch runs that point
+# --workdir/--npy inside the repo. Timing JSON is already covered by *.json.
+wan_t2v_ring_opt/
+wan_opt*.mp4
+wan_opt*.npy
+
+# FA3 CUDA-13 forward-compat driver extraction (machine-specific runtime, not source)
+cuda13-compat/
+
+# Local PR description (kept on disk for reference, not part of the contribution)
+PR.md
